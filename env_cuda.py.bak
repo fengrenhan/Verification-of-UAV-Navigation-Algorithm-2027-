@@ -43,7 +43,7 @@ run = RunFunction.apply
 class Env:
     def __init__(self, batch_size, width, height, grad_decay, device='cpu', fov_x_half_tan=0.53,
                  single=False, gate=False, ground_voxels=False, scaffold=False, speed_mtp=1,
-                 random_rotation=False, cam_angle=10, spawn_z=None) -> None:
+                 random_rotation=False, cam_angle=10) -> None:
         self.device = device
         self.batch_size = batch_size
         self.width = width
@@ -93,7 +93,6 @@ class Env:
         self.speed_mtp = speed_mtp
         self.random_rotation = random_rotation
         self.cam_angle = cam_angle
-        self.spawn_z = spawn_z
         self.fov_x_half_tan = fov_x_half_tan
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
@@ -112,10 +111,9 @@ class Env:
         ], -1).reshape(B, 3, 3)
 
         # env
-        N_OBS = 40   # 障碍数量（原 30）；CUDA kernel 按 size(1) 动态遍历，无需重编译
-        self.balls = torch.rand((B, N_OBS, 4), device=device) * self.ball_w + self.ball_b
-        self.voxels = torch.rand((B, N_OBS, 6), device=device) * self.voxel_w + self.voxel_b
-        self.cyl = torch.rand((B, N_OBS, 3), device=device) * self.cyl_w + self.cyl_b
+        self.balls = torch.rand((B, 30, 4), device=device) * self.ball_w + self.ball_b
+        self.voxels = torch.rand((B, 30, 6), device=device) * self.voxel_w + self.voxel_b
+        self.cyl = torch.rand((B, 30, 3), device=device) * self.cyl_w + self.cyl_b
         self.cyl_h = torch.rand((B, 2, 3), device=device) * self.cyl_h_w + self.cyl_h_b
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
@@ -132,7 +130,7 @@ class Env:
 
         roof = torch.rand((B,)) < 0.5
         self.balls[~roof, :15, :2] = self.cyl[~roof, :15, :2]
-        self.voxels[~roof, :15, :2] = self.cyl[~roof, 15:30, :2]
+        self.voxels[~roof, :15, :2] = self.cyl[~roof, 15:, :2]
         self.balls[~roof, :15] = self.balls[~roof, :15] + self.roof_add[:4]
         self.voxels[~roof, :15] = self.voxels[~roof, :15] + self.roof_add
         self.balls[..., 0] = torch.minimum(torch.maximum(self.balls[..., 0], self.balls[..., 3] + 0.3 / scale), 8 - 0.3 / scale - self.balls[..., 3])
@@ -211,10 +209,6 @@ class Env:
             self.voxels[..., :3] = (R @ self.voxels[..., :3].transpose(1, 2)).transpose(1, 2)
             self.balls[..., :3] = (R @ self.balls[..., :3].transpose(1, 2)).transpose(1, 2)
             self.cyl[..., :3] = (R @ self.cyl[..., :3].transpose(1, 2)).transpose(1, 2)
-
-        if self.spawn_z is not None:
-            self.p[..., 2] = self.spawn_z
-            self.p_target[..., 2] = self.spawn_z
 
         # scaffold
         if self.scaffold and random.random() < 0.5:

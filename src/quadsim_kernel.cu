@@ -193,13 +193,15 @@ __global__ void nearest_pt_cuda_kernel(
         scalar_t cy = pos[j][i][1];
         scalar_t cz = pos[j][i][2];
         scalar_t r = 0.15;
-        scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
-        dist = max(1e-3f, sqrt(dist) - r);
+        scalar_t dx = ox - cx, dy = oy - cy, dz = oz - cz;
+        scalar_t cd = sqrt(dx * dx + dy * dy + 4 * dz * dz);   // 椭圆中心距（与碰撞椭球一致）
+        scalar_t dist = max(1e-3f, cd - r);
         if (dist < min_dist) {
             min_dist = dist;
-            nearest_ptx = ox + dist * (cx - ox);
-            nearest_pty = oy + dist * (cy - oy);
-            nearest_ptz = oz + dist * (cz - oz);
+            scalar_t inv = (cd > 1e-9f) ? (scalar_t)1.0f / cd : (scalar_t)0.0f;
+            nearest_ptx = ox + dist * (cx - ox) * inv;
+            nearest_pty = oy + dist * (cy - oy) * inv;
+            nearest_ptz = oz + dist * (cz - oz) * inv;
         }
     }
 
@@ -209,13 +211,15 @@ __global__ void nearest_pt_cuda_kernel(
         scalar_t cy = balls[batch_base][i][1];
         scalar_t cz = balls[batch_base][i][2];
         scalar_t r = balls[batch_base][i][3];
-        scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + (oz - cz) * (oz - cz);
-        dist = max(1e-3f, sqrt(dist) - r);
+        scalar_t dx = ox - cx, dy = oy - cy, dz = oz - cz;
+        scalar_t cd = sqrt(dx * dx + dy * dy + dz * dz);
+        scalar_t dist = max(1e-3f, cd - r);
         if (dist < min_dist) {
             min_dist = dist;
-            nearest_ptx = ox + dist * (cx - ox);
-            nearest_pty = oy + dist * (cy - oy);
-            nearest_ptz = oz + dist * (cz - oz);
+            scalar_t inv = (cd > 1e-9f) ? (scalar_t)1.0f / cd : (scalar_t)0.0f;
+            nearest_ptx = ox + dist * (cx - ox) * inv;
+            nearest_pty = oy + dist * (cy - oy) * inv;
+            nearest_ptz = oz + dist * (cz - oz) * inv;
         }
     }
 
@@ -224,12 +228,14 @@ __global__ void nearest_pt_cuda_kernel(
         scalar_t cx = cylinders[batch_base][i][0];
         scalar_t cy = cylinders[batch_base][i][1];
         scalar_t r = cylinders[batch_base][i][2];
-        scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy);
-        dist = max(1e-3f, sqrt(dist) - r);
+        scalar_t dx = ox - cx, dy = oy - cy;
+        scalar_t cd = sqrt(dx * dx + dy * dy);
+        scalar_t dist = max(1e-3f, cd - r);
         if (dist < min_dist) {
             min_dist = dist;
-            nearest_ptx = ox + dist * (cx - ox);
-            nearest_pty = oy + dist * (cy - oy);
+            scalar_t inv = (cd > 1e-9f) ? (scalar_t)1.0f / cd : (scalar_t)0.0f;
+            nearest_ptx = ox + dist * (cx - ox) * inv;
+            nearest_pty = oy + dist * (cy - oy) * inv;
             nearest_ptz = oz;
         }
     }
@@ -237,13 +243,15 @@ __global__ void nearest_pt_cuda_kernel(
         scalar_t cx = cylinders_h[batch_base][i][0];
         scalar_t cz = cylinders_h[batch_base][i][1];
         scalar_t r = cylinders_h[batch_base][i][2];
-        scalar_t dist = (ox - cx) * (ox - cx) + (oz - cz) * (oz - cz);
-        dist = max(1e-3f, sqrt(dist) - r);
+        scalar_t dx = ox - cx, dz = oz - cz;
+        scalar_t cd = sqrt(dx * dx + dz * dz);
+        scalar_t dist = max(1e-3f, cd - r);
         if (dist < min_dist) {
             min_dist = dist;
-            nearest_ptx = ox + dist * (cx - ox);
+            scalar_t inv = (cd > 1e-9f) ? (scalar_t)1.0f / cd : (scalar_t)0.0f;
+            nearest_ptx = ox + dist * (cx - ox) * inv;
             nearest_pty = oy;
-            nearest_ptz = oz + dist * (cz - oz);
+            nearest_ptz = oz + dist * (cz - oz) * inv;
         }
     }
 
@@ -333,7 +341,7 @@ void render_cuda(
     size_t state_size = canvas.numel();
     const dim3 blocks((state_size + threads - 1) / threads);
 
-    AT_DISPATCH_FLOATING_TYPES(canvas.type(), "render_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(canvas.scalar_type(), "render_cuda", ([&] {
         render_cuda_kernel<scalar_t><<<blocks, threads>>>(
             canvas.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),
             flow.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
@@ -359,7 +367,7 @@ void rerender_backward_cuda(
     size_t state_size = dddp.numel();
     const dim3 blocks((state_size + threads - 1) / threads);
 
-    AT_DISPATCH_FLOATING_TYPES(depth.type(), "rerender_backward_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(depth.scalar_type(), "rerender_backward_cuda", ([&] {
         rerender_backward_cuda_kernel<scalar_t><<<blocks, threads>>>(
             depth.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
             dddp.packed_accessor<scalar_t,4,torch::RestrictPtrTraits,size_t>(),
@@ -379,7 +387,7 @@ void find_nearest_pt_cuda(
     const int threads = 1024;
     size_t state_size = pos.size(0) * pos.size(1);
     const dim3 blocks((state_size + threads - 1) / threads);
-    AT_DISPATCH_FLOATING_TYPES(pos.type(), "nearest_pt_cuda", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(pos.scalar_type(), "nearest_pt_cuda", ([&] {
         nearest_pt_cuda_kernel<scalar_t><<<blocks, threads>>>(
             nearest_pt.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),
             balls.packed_accessor<scalar_t,3,torch::RestrictPtrTraits,size_t>(),

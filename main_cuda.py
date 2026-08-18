@@ -136,7 +136,7 @@ for i in pbar:
         fwd[:, 2] = 0
         up[:, 2] = 1
         fwd = F.normalize(fwd, 2, -1)
-        R = torch.stack([fwd, torch.cross(up, fwd), up], -1)
+        R = torch.stack([fwd, torch.cross(up, fwd, dim=-1), up], -1)
 
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
         target_v_unit = target_v_raw / target_v_norm

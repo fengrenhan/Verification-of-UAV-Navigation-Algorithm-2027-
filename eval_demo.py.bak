@@ -1,0 +1,179 @@
+import argparse, math
+from random import normalvariate
+import numpy as np
+import torch
+from torch.nn import functional as F
+from env_cuda import Env
+from model import Model
+parser = argparse.ArgumentParser()
+parser.add_argument('--resume', default='checkpoint0004.pth')
+parser.add_argument('--out', default='eval_demo')
+parser.add_argument('--num_rollouts', type=int, default=1)
+parser.add_argument('--timesteps', type=int, default=150)
+parser.add_argument('--grad_decay', type=float, default=0.4)
+parser.add_argument('--speed_mtp', type=float, default=1.0)
+parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
+parser.add_argument('--cam_angle', type=int, default=10)
+parser.add_argument('--single', default=False, action='store_true')
+parser.add_argument('--gate', default=False, action='store_true')
+parser.add_argument('--ground_voxels', default=False, action='store_true')
+parser.add_argument('--scaffold', default=False, action='store_true')
+parser.add_argument('--random_rotation', default=False, action='store_true')
+parser.add_argument('--yaw_drift', default=False, action='store_true')
+parser.add_argument('--no_gif', default=False, action='store_true')
+args = parser.parse_args()
+device = torch.device('cuda')
+state_dict = torch.load(args.resume, map_location=device)
+dim_obs = state_dict['v_proj.weight'].shape[1]
+use_odom = dim_obs == 10
+print(f"detected dim_obs={dim_obs} -> {'with odom' if use_odom else 'no_odom'}")
+model = Model(dim_obs, 6).to(device)
+missing, unexpected = model.load_state_dict(state_dict, strict=False)
+print("missing_keys:", missing)
+print("unexpected_keys:", unexpected)
+model.eval()
+env = Env(8, 64, 48, args.grad_decay, device,
+          fov_x_half_tan=args.fov_x_half_tan, single=args.single,
+          gate=args.gate, ground_voxels=args.ground_voxels,
+          scaffold=args.scaffold, speed_mtp=args.speed_mtp,
+          random_rotation=args.random_rotation, cam_angle=args.cam_angle)
+def rollout():
+    env.reset()
+    model.reset()
+    p_list, v_list, a_list, depth_list, dist_list = [], [], [], [], []
+    act_lag = 1
+    act_buffer = [env.act] * (act_lag + 1)
+    target_v_raw = env.p_target - env.p
+    h = None
+    if args.yaw_drift:
+        drift_av = torch.randn(env.batch_size, device=device) * (5 * math.pi / 180 / 15)
+        zeros = torch.zeros_like(drift_av)
+        ones = torch.ones_like(drift_av)
+        R_drift = torch.stack([
+            torch.cos(drift_av), -torch.sin(drift_av), zeros,
+            torch.sin(drift_av), torch.cos(drift_av), zeros,
+            zeros, zeros, ones], -1).reshape(env.batch_size, 3, 3)
+    with torch.no_grad():
+        for t in range(args.timesteps):
+            ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+            depth, _ = env.render(ctl_dt)
+            depth_list.append(depth[0].cpu().numpy().copy())
+            p_list.append(env.p[0].cpu().numpy().copy())
+            dist_list.append((env.find_vec_to_nearest_pt()[0].norm() - env.margin[0]).item())
+            env.run(act_buffer[t], ctl_dt, target_v_raw)
+            R = env.R
+            fwd = R[:, :, 0].clone()
+            up = torch.zeros_like(fwd)
+            fwd[:, 2] = 0
+            up[:, 2] = 1
+            fwd = F.normalize(fwd, 2, -1)
+            R = torch.stack([fwd, torch.cross(up, fwd, dim=-1), up], -1)
+            if args.yaw_drift:
+                target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
+            else:
+                target_v_raw = env.p_target - env.p.detach()
+            target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
+            target_v_unit = target_v_raw / target_v_norm
+            target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)
+            state = [torch.squeeze(target_v[:, None] @ R, 1),
+                     env.R[:, 2],
+                     env.margin[:, None]]
+            local_v = torch.squeeze(env.v[:, None] @ R, 1)
+            if use_odom:
+                state.insert(0, local_v)
+            state = torch.cat(state, -1)
+            x = 3 / depth.clamp_(0.3, 24) - 0.6
+            x = F.max_pool2d(x[:, None], 4, 4)
+            act, _, h = model(x, state, h)
+            a_pred, v_pred, *_ = (R @ act.reshape(env.batch_size, 3, -1)).unbind(-1)
+            act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
+            act_buffer.append(act)
+            v_list.append(env.v[0].cpu().numpy().copy())
+            a_list.append(act[0].cpu().numpy().copy())
+    return dict(
+        p=np.asarray(p_list), v=np.asarray(v_list), a=np.asarray(a_list),
+        depth=np.asarray(depth_list), dist=np.asarray(dist_list),
+        p_target=env.p_target[0].cpu().numpy().copy(),
+        p_start=p_list[0], margin=env.margin[0].item(),
+        balls=env.balls[0].cpu().numpy().copy(),
+        voxels=env.voxels[0].cpu().numpy().copy(),
+        cyl=env.cyl[0].cpu().numpy().copy())
+results = [rollout() for _ in range(args.num_rollouts)]
+for k, r in enumerate(results):
+    speed = np.linalg.norm(r['v'], axis=1)
+    final_dist = np.linalg.norm(r['p'][-1] - r['p_target'])
+    print(f"rollout {k}: no-collision={r['dist'].min() > 0} "
+          f"min_clearance={r['dist'].min():.3f}m "
+          f"avg_speed={speed.mean():.2f} max_speed={speed.max():.2f} "
+          f"final_dist_to_target={final_dist:.2f}m")
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
+r = results[0]
+fig = plt.figure(figsize=(15, 5))
+ax1 = fig.add_subplot(131, projection='3d')
+ax1.plot(r['p'][:, 0], r['p'][:, 1], r['p'][:, 2], lw=1.5, label='trajectory')
+ax1.scatter(*r['p_start'], c='g', s=60, label='start')
+ax1.scatter(*r['p_target'], c='r', s=60, label='target')
+ax1.scatter(r['balls'][:, 0], r['balls'][:, 1], r['balls'][:, 2],
+            c='k', s=r['balls'][:, 3] * 40, alpha=0.3, label='balls')
+ax1.scatter(r['voxels'][:, 0], r['voxels'][:, 1], r['voxels'][:, 2],
+            c='brown', s=25, alpha=0.3, label='voxels')
+ax1.scatter(r['cyl'][:, 0], r['cyl'][:, 1], np.zeros(len(r['cyl'])),
+            c='gray', s=r['cyl'][:, 2] * 60, alpha=0.3, label='cylinders')
+ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('z')
+ax1.legend(fontsize=7)
+ax2 = fig.add_subplot(132)
+ax2.plot(np.linalg.norm(r['v'], axis=1), label='speed (m/s)')
+ax2.set_xlabel('step'); ax2.set_ylabel('speed')
+ax2b = ax2.twinx()
+ax2b.plot(r['dist'], 'r--', lw=1, label='clearance')
+ax2b.set_ylabel('clearance (m)')
+lines = ax2.get_lines() + ax2b.get_lines()
+ax2.legend(lines, [l.get_label() for l in lines], fontsize=7)
+ax3 = fig.add_subplot(133)
+ax3.plot(r['a'][:, 0], label='ax')
+ax3.plot(r['a'][:, 1], label='ay')
+ax3.plot(r['a'][:, 2], label='az')
+ax3.legend(fontsize=7)
+ax3.set_xlabel('step'); ax3.set_ylabel('ctrl accel')
+fig.tight_layout()
+fig.savefig(f'{args.out}.png', dpi=110)
+print(f"saved {args.out}.png")
+if not args.no_gif:
+    from PIL import Image
+    frames = []
+    for d in r['depth']:
+        x = 3 / np.clip(d, 0.3, 24) - 0.6
+        x = (x - x.min()) / (x.max() - x.min() + 1e-9)
+        frames.append(Image.fromarray((x * 255).astype(np.uint8)).resize((128, 96)))
+    frames[0].save(f'{args.out}.gif', save_all=True,
+                   append_images=frames[1:], duration=67, loop=0)
+    print(f"saved {args.out}.gif ({len(frames)} frames)")
+    # ---- 高空俯视 GIF + 数据缓存 (render_high_view) ----
+    import inspect as _inspect
+    from render_high_view import render_high_angle_gif
+    np.savez_compressed(f'{args.out}_flight.npz',
+                        p=r['p'], v=r['v'], a=r['a'], dist=r['dist'],
+                        balls=r['balls'], voxels=r['voxels'], cyl=r['cyl'],
+                        target=r['p_target'], start=r['p_start'])
+    print(f"saved {args.out}_flight.npz")
+    _kw = dict(pos=r['p'],
+               obstacles=[(r['balls'][i, :3], float(r['balls'][i, 3]))
+                          for i in range(len(r['balls']))],
+               target=r['p_target'], out=f'{args.out}_highview.gif',
+               elev=70, cam_mode='follow')
+    _sig = _inspect.signature(render_high_angle_gif).parameters
+    if 'voxels' in _sig:
+        _kw['voxels'] = r['voxels']
+    for _name in ('cylinders', 'cyls', 'cyl'):
+        if _name in _sig:
+            _kw[_name] = r['cyl']
+            break
+    try:
+        render_high_angle_gif(**_kw)
+        print(f"saved {args.out}_highview.gif")
+    except Exception as _e:
+        import traceback; traceback.print_exc()
+        print(f"highview failed: {_e} (npz 已保存，可用 CLI 重试)")
+
